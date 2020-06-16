@@ -78,7 +78,7 @@ namespace Microsoft.AspNetCore.Mvc.Razor.Extensions.Version2_X
 
             Assert.NotNull(diagnostic);
             Assert.Equal(expectedDiagnostic.Id, diagnostic.Id);
-            Assert.True(expectedDiagnostic.Span.Equals(diagnostic.Span));
+            Assert.True(expectedDiagnostic.Span.Equals(diagnostic.Span), "Expected: " + expectedDiagnostic.Span.ToString() + Environment.NewLine + Environment.NewLine + "Actual: " + diagnostic.Span.ToString());
 
             Assert.Equal(expectedDiagnostic.ToString(), diagnostic.ToString());
         }
