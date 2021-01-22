@@ -29,13 +29,10 @@ namespace Microsoft.AspNetCore.Certificates.Generation
 
         public const int RSAMinimumKeySizeInBits = 2048;
 
-        public static CertificateManager Instance { get; } = OperatingSystem.IsWindows() ?
-#pragma warning disable CA1416 // Validate platform compatibility
-            new WindowsCertificateManager() :
-#pragma warning restore CA1416 // Validate platform compatibility
-            OperatingSystem.IsMacOS() ?
-                new MacOSCertificateManager() as CertificateManager :
-                new UnixCertificateManager();
+        public static CertificateManager Instance { get; } =
+            OperatingSystem.IsWindows() ? new WindowsCertificateManager() :
+            OperatingSystem.IsMacOS() ? new MacOSCertificateManager() :
+            new UnixCertificateManager();
 
         public static CertificateManagerEventSource Log { get; set; } = new CertificateManagerEventSource();
 
@@ -62,10 +59,9 @@ namespace Microsoft.AspNetCore.Certificates.Generation
         }
 
         public bool IsHttpsDevelopmentCertificate(X509Certificate2 certificate) =>
-            certificate.Extensions.OfType<X509Extension>()
-            .Any(e => string.Equals(AspNetHttpsOid, e.Oid?.Value, StringComparison.Ordinal));
+            HasOid(certificate, AspNetHttpsOid);
 
-        public IList<X509Certificate2> ListCertificates(
+        public List<X509Certificate2> ListCertificates(
             StoreName storeName,
             StoreLocation location,
             bool isValid,
@@ -73,51 +69,55 @@ namespace Microsoft.AspNetCore.Certificates.Generation
         {
             Log.ListCertificatesStart(location, storeName);
             var certificates = new List<X509Certificate2>();
+            var matchingCertificates = new List<X509Certificate2>();
             try
             {
                 using var store = new X509Store(storeName, location);
                 store.Open(OpenFlags.ReadOnly);
-                certificates.AddRange(store.Certificates.OfType<X509Certificate2>());
-                IEnumerable<X509Certificate2> matchingCertificates = certificates;
-                matchingCertificates = matchingCertificates
-                    .Where(c => HasOid(c, AspNetHttpsOid));
+                X509Certificate2Collection storeCerts = store.Certificates;
 
+                // Find all matching certificates
+                for (int i = 0; i < storeCerts.Count; i++)
+                {
+                    X509Certificate2 cert = storeCerts[i];
+                    certificates.Add(storeCerts[i]);
+                    if (IsHttpsDevelopmentCertificate(cert))
+                    {
+                        matchingCertificates.Add(cert);
+                    }
+                }
                 if (Log.IsEnabled())
                 {
                     Log.DescribeFoundCertificates(ToCertificateDescription(matchingCertificates));
                 }
 
+                // If requested, filter out invalid certificates.
                 if (isValid)
                 {
-                    // Ensure the certificate hasn't expired, has a private key and its exportable
-                    // (for container/unix scenarios).
+                    // Ensure each certificate hasn't expired, has a private key, and is exportable (for container/unix scenarios).
                     Log.CheckCertificatesValidity();
                     var now = DateTimeOffset.Now;
-                    var validCertificates = matchingCertificates
-                        .Where(c => IsValidCertificate(c, now, requireExportable))
-                        .OrderByDescending(c => GetCertificateVersion(c))
-                        .ToArray();
 
-                    if (Log.IsEnabled())
+                    List<X509Certificate2>? invalidCertificates = Log.IsEnabled() ? new List<X509Certificate2>() : null;
+                    for (int i = 0; i < matchingCertificates.Count; i++)
                     {
-                        var invalidCertificates = matchingCertificates.Except(validCertificates);
-                        Log.DescribeValidCertificates(ToCertificateDescription(validCertificates));
-                        Log.DescribeInvalidValidCertificates(ToCertificateDescription(invalidCertificates));
+                        X509Certificate2 cert = matchingCertificates[i];
+                        if (!IsValidCertificate(cert, now, requireExportable))
+                        {
+                            matchingCertificates[i] = null!;
+                            invalidCertificates?.Add(cert);
+                        }
                     }
 
-                    matchingCertificates = validCertificates;
+                    // Sort the valid certs by version, descending
+                    matchingCertificates.Sort((c1, c2) => GetCertificateVersion(c2).CompareTo(GetCertificateVersion(c1)));
+
+                    if (invalidCertificates != null)
+                    {
+                        Log.DescribeValidCertificates(ToCertificateDescription(matchingCertificates));
+                        Log.DescribeInvalidValidCertificates(ToCertificateDescription(invalidCertificates));
+                    }
                 }
-
-                // We need to enumerate the certificates early to prevent disposing issues.
-                matchingCertificates = matchingCertificates.ToList();
-
-                var certificatesToDispose = certificates.Except(matchingCertificates);
-                DisposeCertificates(certificatesToDispose);
-
-                store.Close();
-
-                Log.ListCertificatesEnd();
-                return (IList<X509Certificate2>)matchingCertificates;
             }
             catch (Exception e)
             {
@@ -125,39 +125,55 @@ namespace Microsoft.AspNetCore.Certificates.Generation
                 {
                     Log.ListCertificatesError(e.ToString());
                 }
-                DisposeCertificates(certificates);
-                certificates.Clear();
-                return certificates;
+
+                matchingCertificates.Clear();
             }
-
-            bool HasOid(X509Certificate2 certificate, string oid) =>
-                certificate.Extensions.OfType<X509Extension>()
-                    .Any(e => string.Equals(oid, e.Oid?.Value, StringComparison.Ordinal));
-
-            static byte GetCertificateVersion(X509Certificate2 c)
+            finally
             {
-                var byteArray = c.Extensions.OfType<X509Extension>()
-                    .Where(e => string.Equals(AspNetHttpsOid, e.Oid?.Value, StringComparison.Ordinal))
-                    .Single()
-                    .RawData;
-
-                if ((byteArray.Length == AspNetHttpsOidFriendlyName.Length && byteArray[0] == (byte)'A') || byteArray.Length == 0)
-                {
-                    // No Version set, default to 0
-                    return 0b0;
-                }
-                else
-                {
-                    // Version is in the only byte of the byte array.
-                    return byteArray[0];
-                }
+                DisposeCertificates(matchingCertificates.Count > 0 ? certificates.Except(matchingCertificates) : certificates);
             }
+
+            Log.ListCertificatesEnd();
+            return matchingCertificates;
 
             bool IsValidCertificate(X509Certificate2 certificate, DateTimeOffset currentDate, bool requireExportable) =>
                 certificate.NotBefore <= currentDate &&
                 currentDate <= certificate.NotAfter &&
                 (!requireExportable || IsExportable(certificate)) &&
                 GetCertificateVersion(certificate) >= AspNetHttpsCertificateVersion;
+
+            static byte GetCertificateVersion(X509Certificate2 c)
+            {
+                X509ExtensionCollection ec = c.Extensions;
+                for (int i = 0; i < ec.Count; i++)
+                {
+                    X509Extension e = ec[i];
+                    if (e.Oid?.Value == AspNetHttpsOid)
+                    {
+                        byte[] byteArray = e.RawData;
+                        return (byteArray.Length == AspNetHttpsOidFriendlyName.Length && byteArray[0] == (byte)'A') || byteArray.Length == 0 ?
+                            0 : // No Version set, default to 0
+                            byteArray[0]; // Version is in the only byte of the byte array.
+                    }
+                }
+
+                Debug.Fail("Method should have only been called when known to be a proper certificate");
+                throw new InvalidOperationException("Certificate lacks ASP.NET HTTPS OID");
+            }
+        }
+
+        private static bool HasOid(X509Certificate2 certificate, string oid)
+        {
+            X509ExtensionCollection c = certificate.Extensions;
+            for (int i = 0; i < c.Count; i++)
+            {
+                if (c[i].Oid?.Value == oid)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         public IList<X509Certificate2> GetHttpsCertificates() =>
@@ -174,71 +190,41 @@ namespace Microsoft.AspNetCore.Certificates.Generation
             bool isInteractive = true)
         {
             var result = EnsureCertificateResult.Succeeded;
+            X509Certificate2? certificate = null;
+            bool isNewCertificate = false;
+            IEnumerable<X509Certificate2> certificates;
 
+            // Find a matching certificate from CurrentUser
             var currentUserCertificates = ListCertificates(StoreName.My, StoreLocation.CurrentUser, isValid: true, requireExportable: true);
-            var trustedCertificates = ListCertificates(StoreName.My, StoreLocation.LocalMachine, isValid: true, requireExportable: true);
-            var certificates = currentUserCertificates.Concat(trustedCertificates);
+            certificates = currentUserCertificates;
+            certificate = FindSubject(Subject, currentUserCertificates);
 
-            var filteredCertificates = certificates.Where(c => c.Subject == Subject);
-
+            // If we couldn't find one, look in LocalMachine.
+            if (certificate is null)
+            {
+                List<X509Certificate2>? trustedCertificates = ListCertificates(StoreName.My, StoreLocation.LocalMachine, isValid: true, requireExportable: true);
+                certificates = currentUserCertificates.Concat(trustedCertificates);
+                certificate = FindSubject(Subject, trustedCertificates);
+            }
+            
             if (Log.IsEnabled())
             {
-                var excludedCertificates = certificates.Except(filteredCertificates);
-                Log.FilteredCertificates(ToCertificateDescription(filteredCertificates));
-                Log.ExcludedCertificates(ToCertificateDescription(excludedCertificates));
+                Log.FilteredCertificates(ToCertificateDescription(certificates.Where(c => c.Subject == Subject)));
+                Log.ExcludedCertificates(ToCertificateDescription(certificates.Where(c => c.Subject != Subject)));
             }
 
-            certificates = filteredCertificates;
-
-            X509Certificate2? certificate = null;
-            var isNewCertificate = false;
-            if (certificates.Any())
+            if (certificate != null)
             {
-                certificate = certificates.First();
-                var failedToFixCertificateState = false;
-                if (isInteractive)
-                {
-                    // Skip this step if the command is not interactive,
-                    // as we don't want to prompt on first run experience.
-                    foreach (var candidate in currentUserCertificates)
-                    {
-                        var status = CheckCertificateState(candidate, true);
-                        if (!status.Success)
-                        {
-                            try
-                            {
-                                if (Log.IsEnabled())
-                                {
-                                    Log.CorrectCertificateStateStart(GetDescription(candidate));
-                                }
-                                CorrectCertificateState(candidate);
-                                Log.CorrectCertificateStateEnd();
-                            }
-                            catch (Exception e)
-                            {
-                                if (Log.IsEnabled())
-                                {
-                                    Log.CorrectCertificateStateError(e.ToString());
-                                }
-                                result = EnsureCertificateResult.FailedToMakeKeyAccessible;
-                                // We don't return early on this type of failure to allow for tooling to
-                                // export or trust the certificate even in this situation, as that enables
-                                // exporting the certificate to perform any necessary fix with native tooling.
-                                failedToFixCertificateState = true;
-                            }
-                        }
-                    }
-                }
+                var failedToFixCertificateState =
+                    isInteractive && // Skip this step if the command is not interactive, as we don't want to prompt on first run experience.
+                    CorrectCertificateStates(currentUserCertificates, ref result);
 
                 if (!failedToFixCertificateState)
                 {
                     if (Log.IsEnabled())
                     {
-                        Log.ValidCertificatesFound(ToCertificateDescription(certificates));
-                    }
-                    certificate = certificates.First();
-                    if (Log.IsEnabled())
-                    {
+                        string localSubject = Subject;
+                        Log.ValidCertificatesFound(ToCertificateDescription(certificates.Where(c => c.Subject == Subject)));
                         Log.SelectedCertificate(GetDescription(certificate));
                     }
                     result = EnsureCertificateResult.ValidCertificatePresent;
@@ -344,6 +330,55 @@ namespace Microsoft.AspNetCore.Certificates.Generation
             DisposeCertificates(!isNewCertificate ? certificates : certificates.Append(certificate));
 
             return result;
+
+            static X509Certificate2? FindSubject(string subject, List<X509Certificate2> certificates)
+            {
+                foreach (X509Certificate2 cert in certificates)
+                {
+                    if (cert.Subject == subject)
+                    {
+                        return cert;
+                    }
+                }
+
+                return null;
+            }
+        }
+
+        private bool CorrectCertificateStates(List<X509Certificate2> currentUserCertificates, ref EnsureCertificateResult result)
+        {
+            bool failedToFixCertificateState = false;
+
+            foreach (var candidate in currentUserCertificates)
+            {
+                var status = CheckCertificateState(candidate, interactive: true);
+                if (!status.Success)
+                {
+                    try
+                    {
+                        if (Log.IsEnabled())
+                        {
+                            Log.CorrectCertificateStateStart(GetDescription(candidate));
+                        }
+                        CorrectCertificateState(candidate);
+                        Log.CorrectCertificateStateEnd();
+                    }
+                    catch (Exception e)
+                    {
+                        if (Log.IsEnabled())
+                        {
+                            Log.CorrectCertificateStateError(e.ToString());
+                        }
+                        result = EnsureCertificateResult.FailedToMakeKeyAccessible;
+                        // We don't return early on this type of failure to allow for tooling to
+                        // export or trust the certificate even in this situation, as that enables
+                        // exporting the certificate to perform any necessary fix with native tooling.
+                        failedToFixCertificateState = true;
+                    }
+                }
+            }
+
+            return failedToFixCertificateState;
         }
 
         internal ImportCertificateResult ImportCertificate(string certificatePath, string password)
@@ -355,7 +390,7 @@ namespace Microsoft.AspNetCore.Certificates.Generation
             }
 
             var certificates = ListCertificates(StoreName.My, StoreLocation.CurrentUser, isValid: false, requireExportable: false);
-            if (certificates.Any())
+            if (certificates.Count != 0)
             {
                 if (Log.IsEnabled())
                 {
@@ -595,14 +630,8 @@ namespace Microsoft.AspNetCore.Certificates.Generation
                 pathLengthConstraint: 0,
                 critical: true);
 
-            byte[] bytePayload;
-
-            if (AspNetHttpsCertificateVersion != 0)
-            {
-                bytePayload = new byte[1];
-                bytePayload[0] = (byte)AspNetHttpsCertificateVersion;
-            }
-            else
+            Span<byte> bytePayload = stackalloc byte[1] { (byte)AspNetHttpsCertificateVersion };
+            if (AspNetHttpsCertificateVersion == 0)
             {
                 bytePayload = Encoding.ASCII.GetBytes(AspNetHttpsOidFriendlyName);
             }
@@ -700,7 +729,7 @@ namespace Microsoft.AspNetCore.Certificates.Generation
 
         internal X509Certificate2 CreateSelfSignedCertificate(
             X500DistinguishedName subject,
-            IEnumerable<X509Extension> extensions,
+            List<X509Extension> extensions,
             DateTimeOffset notBefore,
             DateTimeOffset notAfter)
         {
